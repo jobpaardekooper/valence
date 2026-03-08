@@ -143,9 +143,8 @@ impl LoadedChunk {
         Self {
             viewer_count: AtomicU32::new(0),
             sections: vec![Section::default(); section_count].into(),
-            // HACK: We don't have a full lighting engine implemented. To avoid shrouding the
-            // world in darkness, give all chunks the max amount of sky light light.
-            sky_light_sections: vec![LightSection::with_full_light(); light_section_count].into(),
+            sky_light_sections: vec![LightSection::default(); light_section_count].into(),
+            // We don't have a full lighting engine implemented so we set all block light to be fully dark.
             block_light_sections: vec![LightSection::with_zeroed_light(); light_section_count]
                 .into(),
             block_entities: BTreeMap::new(),
@@ -500,6 +499,18 @@ impl LoadedChunk {
             let mut block_light_arrays = Vec::with_capacity(light_section_count);
 
             for (i, sky_light) in self.sky_light_sections.iter().enumerate() {
+                // For sky light...
+
+                // HACK: We don't have a full lighting engine implemented and we don't load height maps or
+                // light from the world data. To avoid shrouding the world in darkness,
+                // we calculate the sky light sections here from scratch. What would also work is
+                // setting all sky light sections to Single(0xff), but that uses a lot more ram if you have many chunks.
+                // Currently, setting Single(0xff) for all sky light will start failing many_players_spread_out benchmark
+                // due to OOM. So calculating the sky light sections from scratch here, meason we don't have to store sky light
+                // for most sections since most sky light sections in a chunk are NotSet (fully lit or fully dark).
+
+                // TODO: Calculate sky light
+
                 LoadedChunk::fill_light_data(
                     sky_light,
                     &mut sky_light_arrays,
