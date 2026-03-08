@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::mem;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -132,13 +132,6 @@ impl LoadedChunk {
         Self {
             viewer_count: AtomicU32::new(0),
             sections: vec![Section::default(); section_count].into(),
-            // We don't have a full lighting engine implemented so we set all sky light to be
-            // default (NotSet) so that no light data is sent to the client and we rely
-            // on a hack that sets ambient light to full brightness for all dimensions
-            // to make the chunks appear fully lit. We don't send
-            // LightSection::with_full_light() here instead of the ambient light hack because this
-            // is extremely unoptimized in terms of memory consumption and crashes the
-            // many_players_spread_out benchmark/test.
             sky_light_sections: vec![LightSection::default(); light_section_count].into(),
             // We don't have a full lighting engine implemented so we set all block light to be
             // fully dark.
@@ -424,6 +417,240 @@ impl LoadedChunk {
         data
     }
 
+    #[inline]
+    fn light_idx(x: u32, y: u32, z: u32) -> usize {
+        (x + z * 16 + y * 16 * 16) as usize
+    }
+
+    fn sky_light_filter_attenuation(state: BlockState) -> u8 {
+        let kind = state.to_kind();
+
+        let is_transparent_waterlogged =
+            state.get(PropName::Waterlogged) == Some(PropValue::True) && !state.is_opaque();
+
+        (state.is_liquid()
+            || is_transparent_waterlogged
+            || Self::is_leaf_block(state)
+            || matches!(
+                kind,
+                BlockKind::BubbleColumn
+                    | BlockKind::Ice
+                    | BlockKind::FrostedIce
+                    | BlockKind::Cobweb
+                    | BlockKind::SlimeBlock
+                    | BlockKind::HoneyBlock
+                    | BlockKind::Spawner
+                    | BlockKind::Beacon
+                    | BlockKind::EndGateway
+                    | BlockKind::ChorusPlant
+                    | BlockKind::ChorusFlower
+            )
+            || kind.to_str().ends_with("_shulker_box"))
+        .into()
+    }
+
+    fn calculate_sky_light_values(&self, world_surface: &[u32; 16 * 16]) -> Vec<u8> {
+        let mut light = vec![0_u8; self.height() as usize * 16 * 16];
+        let mut queue = VecDeque::new();
+
+        for z in 0_u32..16 {
+            for x in 0_u32..16 {
+                let col_idx = (z * 16 + x) as usize;
+                let world_surface_y = world_surface[col_idx].min(self.height());
+                let mut vertical_light = 15_u8;
+
+                for y in (world_surface_y..self.height()).rev() {
+                    let idx = Self::light_idx(x, y, z);
+                    if light[idx] < 15 {
+                        light[idx] = 15;
+                        queue.push_back((x, y, z));
+                    }
+                }
+
+                for y in (0..world_surface_y).rev() {
+                    let state = self.block_state(x, y, z);
+
+                    if state.is_opaque() {
+                        break;
+                    }
+
+                    let attenuation = if vertical_light == 15 {
+                        Self::sky_light_filter_attenuation(state)
+                    } else {
+                        1
+                    };
+                    vertical_light = vertical_light.saturating_sub(attenuation);
+
+                    if vertical_light == 0 {
+                        break;
+                    }
+
+                    let idx = Self::light_idx(x, y, z);
+                    if vertical_light > light[idx] {
+                        light[idx] = vertical_light;
+                        queue.push_back((x, y, z));
+                    }
+                }
+            }
+        }
+
+        while let Some((x, y, z)) = queue.pop_front() {
+            let current = light[Self::light_idx(x, y, z)];
+
+            if current == 0 {
+                continue;
+            }
+
+            for (dx, dy, dz) in [
+                (-1_i32, 0_i32, 0_i32),
+                (1, 0, 0),
+                (0, -1, 0),
+                (0, 1, 0),
+                (0, 0, -1),
+                (0, 0, 1),
+            ] {
+                let nx = x as i32 + dx;
+                let ny = y as i32 + dy;
+                let nz = z as i32 + dz;
+
+                if !(0..16).contains(&nx) || !(0..16).contains(&nz) {
+                    continue;
+                }
+
+                if !(0..self.height() as i32).contains(&ny) {
+                    continue;
+                }
+
+                let nx = nx as u32;
+                let ny = ny as u32;
+                let nz = nz as u32;
+
+                let neighbor_state = self.block_state(nx, ny, nz);
+
+                if neighbor_state.is_opaque() {
+                    continue;
+                }
+
+                let attenuation = if current == 15 && dy == -1 {
+                    Self::sky_light_filter_attenuation(neighbor_state)
+                } else {
+                    1
+                };
+                let propagated = current.saturating_sub(attenuation);
+
+                if propagated == 0 {
+                    continue;
+                }
+
+                let nidx = Self::light_idx(nx, ny, nz);
+                if propagated > light[nidx] {
+                    light[nidx] = propagated;
+                    queue.push_back((nx, ny, nz));
+                }
+            }
+        }
+
+        light
+    }
+
+    fn has_blocks_in_chunk_section(section_has_blocks: &[bool], section_y: isize) -> bool {
+        section_y
+            .try_into()
+            .ok()
+            .and_then(|idx: usize| section_has_blocks.get(idx))
+            .copied()
+            .unwrap_or(false)
+    }
+
+    fn calculate_sky_light_section(
+        &self,
+        section_idx: usize,
+        sky_light_values: &[u8],
+        section_has_blocks: &[bool],
+        opaque_heightmap: &[u32; 16 * 16],
+    ) -> LightSection {
+        let chunk_section_y = section_idx as isize - 1;
+
+        let section_has_no_blocks =
+            !Self::has_blocks_in_chunk_section(section_has_blocks, chunk_section_y);
+        let section_above_has_no_blocks =
+            !Self::has_blocks_in_chunk_section(section_has_blocks, chunk_section_y + 1);
+
+        if section_has_no_blocks && section_above_has_no_blocks {
+            return LightSection::NotSet;
+        }
+
+        if chunk_section_y < 0 || chunk_section_y >= self.sections.len() as isize {
+            return LightSection::with_zeroed_light();
+        }
+
+        let section_top_y = chunk_section_y as u32 * 16 + 15;
+        if opaque_heightmap.iter().all(|&h| h > section_top_y) {
+            return LightSection::with_zeroed_light();
+        }
+
+        let section_start_y = chunk_section_y as u32 * 16;
+        let mut data = [0_u8; 2048];
+        let mut first_value = 0_u8;
+        let mut has_first_value = false;
+        let mut is_uniform = true;
+        let mut block_idx = 0_usize;
+
+        for local_y in 0_u32..16 {
+            for z in 0_u32..16 {
+                for x in 0_u32..16 {
+                    let y = section_start_y + local_y;
+                    let light = sky_light_values[Self::light_idx(x, y, z)] & 0x0f;
+
+                    if has_first_value {
+                        is_uniform &= light == first_value;
+                    } else {
+                        first_value = light;
+                        has_first_value = true;
+                    }
+
+                    let nibble_idx = block_idx / 2;
+                    if block_idx.is_multiple_of(2) {
+                        data[nibble_idx] = light;
+                    } else {
+                        data[nibble_idx] |= light << 4;
+                    }
+
+                    block_idx += 1;
+                }
+            }
+        }
+
+        if is_uniform {
+            let value = first_value | (first_value << 4);
+            LightSection::Single(value)
+        } else {
+            LightSection::from_data(data)
+        }
+    }
+
+    fn calculate_sky_light_sections(&self, world_surface: &[u32; 16 * 16]) -> Box<[LightSection]> {
+        let light_section_count = self.sections.len() + 2;
+        let sky_light_values = self.calculate_sky_light_values(world_surface);
+        let section_has_blocks: Vec<bool> = self
+            .sections
+            .iter()
+            .map(|section| section.count_non_air_blocks() != 0)
+            .collect();
+        let opaque_heightmap = self.build_heightmap(|state| state.is_opaque());
+
+        (0..light_section_count)
+            .map(|i| {
+                self.calculate_sky_light_section(
+                    i,
+                    &sky_light_values,
+                    &section_has_blocks,
+                    &opaque_heightmap,
+                )
+            })
+            .collect()
+    }
+
     fn fill_light_data(
         light: &LightSection,
         light_arrays: &mut Vec<FixedArray<u8, 2048>>,
@@ -470,6 +697,51 @@ impl LoadedChunk {
             let motion_blocking_no_leaves = self.motion_blocking_no_leaves();
             let world_height = self.height();
 
+            // HACK: We don't have a full lighting engine implemented and we don't load
+            // height maps or light from the world data. To avoid shrouding the
+            // world in darkness, we calculate the sky light sections here from
+            // scratch. What would also work is setting all sky light sections
+            // to Single(0xff), but that uses a lot more ram if you have many chunks.
+            // Currently, setting Single(0xff) for all sky light will start failing
+            // many_players_spread_out benchmark due to OOM. So calculating the
+            // sky light sections from scratch here, meaning we don't have to store sky
+            // light for most sections since most sky light sections in a chunk
+            // are NotSet (fully lit or fully dark).
+
+            // This currently sky lighting implementation was based off the sky light
+            // description on the wiki:
+            //     - https://minecraft.wiki/w/Light#Sky_light
+            //
+            // The current implementation is incomplete in two main ways:
+            // 1. We don't consider partial directional occlusion from blocks and we treat locks like that as fully light blocking.
+            //     Real vanilla lighting uses face/shape occlusion between two neighboring blocks, not just “opaque or not”.
+            //     https://minecraft.wiki/w/Light#:~:text=directional%20opacity
+            //     So for blocks like slabs/stairs/path blocks:
+            //         - They may block light in one direction but not others.
+            //         - is_opaque() can’t express that per-face behavior.
+            //         - Our current model treats them as either fully blocking or fully
+            //           non-blocking, which is an approximation.
+            //
+            // 2. We don't calculate sky light across chunk boundaries. This is because we
+            //    don't have the context here for other chunks. We approximate what how the
+            //    sky light would propagate within the chunk itself, but we don't consider
+            //    how neighboring chunks might affect the sky light at the edges of the
+            //    chunk.
+            //
+            //     Vanilla handles this by running a chunk-light graph update across chunk
+            // boundaries:
+            //         - It stores light in a global light engine (not isolated per chunk
+            //           packet build).
+            //         - When chunks load/change, it enqueues light updates.
+            //         - Propagation crosses chunk edges into loaded neighbors.
+            //         - If a neighbor isn’t loaded yet, updates are deferred/continued when
+            //           that chunk becomes available.
+            //         - Network packets then send changed light sections to clients
+            //           incrementally (LightUpdate), instead of recomputing a chunk in
+            //           isolation each time.
+
+            let calculated_sky_light_sections = self.calculate_sky_light_sections(&world_surface);
+
             let heightmaps = vec![
                 HeightMap {
                     kind: HeightMapKind::WorldSurface,
@@ -497,7 +769,14 @@ impl LoadedChunk {
             let mut sky_light_arrays = Vec::with_capacity(light_section_count);
             let mut block_light_arrays = Vec::with_capacity(light_section_count);
 
-            for (i, sky_light) in self.sky_light_sections.iter().enumerate() {
+            for (i, sky_light_override) in self.sky_light_sections.iter().enumerate() {
+                let sky_light_calculated = &calculated_sky_light_sections[i];
+                let sky_light = if matches!(sky_light_override, LightSection::NotSet) {
+                    sky_light_calculated
+                } else {
+                    sky_light_override
+                };
+
                 LoadedChunk::fill_light_data(
                     sky_light,
                     &mut sky_light_arrays,
@@ -575,7 +854,7 @@ impl LoadedChunk {
                     block_entities: Cow::Owned(block_entities),
                     sky_light_mask: Cow::Borrowed(&sky_light_mask.into_data()),
                     block_light_mask: Cow::Borrowed(&block_light_mask.into_data()),
-                    empty_sky_light_mask: Cow::Borrowed(&[]),
+                    empty_sky_light_mask: Cow::Borrowed(&empty_sky_light_mask.into_data()),
                     empty_block_light_mask: Cow::Borrowed(&empty_block_light_mask.into_data()),
                     sky_light_arrays: Cow::Borrowed(&sky_light_arrays),
                     block_light_arrays: Cow::Borrowed(&block_light_arrays),
@@ -979,5 +1258,45 @@ mod tests {
         let decoded = decode_heightmap(&encoded, 10);
         assert_eq!(decoded[heightmap_idx(0, 0)], 512);
         assert_eq!(decoded[heightmap_idx(1, 0)], 0);
+    }
+
+    #[test]
+    fn skylight_filtering_blocks_attenuate_vertical_light() {
+        let mut chunk = LoadedChunk::new(32);
+
+        chunk.fill_block_states(BlockState::STONE);
+        for y in 0..31 {
+            chunk.set_block_state(0, y, 0, BlockState::AIR);
+        }
+        chunk.set_block_state(0, 31, 0, BlockState::WATER);
+
+        let world_surface = chunk.world_surface();
+        let sky_light = chunk.calculate_sky_light_values(&world_surface);
+
+        assert_eq!(sky_light[LoadedChunk::light_idx(0, 31, 0)], 14);
+        assert_eq!(sky_light[LoadedChunk::light_idx(0, 30, 0)], 13);
+        assert_eq!(sky_light[LoadedChunk::light_idx(1, 31, 0)], 0);
+    }
+
+    #[test]
+    fn skylight_sections_optimization_notset_and_underground_zero() {
+        let chunk = LoadedChunk::new(32);
+        let world_surface = chunk.world_surface();
+        let sky_light_sections = chunk.calculate_sky_light_sections(&world_surface);
+
+        assert!(sky_light_sections
+            .iter()
+            .all(|section| matches!(section, LightSection::NotSet)));
+
+        let mut chunk = LoadedChunk::new(32);
+        chunk.fill_block_state_section(1, BlockState::STONE);
+
+        let world_surface = chunk.world_surface();
+        let sky_light_sections = chunk.calculate_sky_light_sections(&world_surface);
+
+        assert!(matches!(sky_light_sections[0], LightSection::NotSet));
+        assert!(matches!(sky_light_sections[1], LightSection::Single(0x00)));
+        assert!(matches!(sky_light_sections[2], LightSection::Single(0x00)));
+        assert!(matches!(sky_light_sections[3], LightSection::NotSet));
     }
 }
