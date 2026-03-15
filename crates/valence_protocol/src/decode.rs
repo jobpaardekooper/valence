@@ -1,7 +1,7 @@
 #[cfg(feature = "encryption")]
 use aes::cipher::{generic_array::GenericArray, BlockDecryptMut, BlockSizeUser, KeyIvInit};
 use anyhow::{bail, ensure, Context};
-use bytes::{Buf, BytesMut};
+use bytes::BytesMut;
 use valence_binary::{Decode, VarInt, VarIntDecodeError};
 
 #[cfg(feature = "compression")]
@@ -30,6 +30,10 @@ impl PacketDecoder {
     }
 
     pub fn try_next_packet(&mut self) -> anyhow::Result<Option<PacketFrame>> {
+        Ok(self.try_next_packet_with_raw()?.map(|packet| packet.frame))
+    }
+
+    pub fn try_next_packet_with_raw(&mut self) -> anyhow::Result<Option<PacketFrameWithRaw>> {
         let mut r = &self.buf[..];
 
         let packet_len = match VarInt::decode_partial(&mut r) {
@@ -44,97 +48,93 @@ impl PacketDecoder {
         );
 
         if r.len() < packet_len as usize {
-            // Not enough data arrived yet.
             return Ok(None);
         }
 
         let packet_len_len = VarInt(packet_len).written_size();
+        let total_packet_len = packet_len_len + packet_len as usize;
+        let raw = self.buf.split_to(total_packet_len);
 
-        let mut data;
+        let packet = self.decode_packet_data(packet_len, packet_len_len, &raw)?;
 
-        #[cfg(feature = "compression")]
-        if self.threshold.0 >= 0 {
-            use std::io::Write;
+        Ok(Some(PacketFrameWithRaw { frame: packet, raw }))
+    }
 
-            use bytes::BufMut;
-            use flate2::write::ZlibDecoder;
+    fn decode_packet_data(
+        &mut self,
+        packet_len: i32,
+        packet_len_len: usize,
+        raw: &[u8],
+    ) -> anyhow::Result<PacketFrame> {
+        let mut r = &raw[packet_len_len..packet_len_len + packet_len as usize];
 
-            r = &r[..packet_len as usize];
+        let data = {
+            #[cfg(feature = "compression")]
+            if self.threshold.0 >= 0 {
+                use std::io::Write;
 
-            let data_len = VarInt::decode(&mut r)?.0;
+                use bytes::BufMut;
+                use flate2::write::ZlibDecoder;
 
-            ensure!(
-                (0..MAX_PACKET_SIZE).contains(&data_len),
-                "decompressed packet length of {data_len} is out of bounds"
-            );
-
-            // Is this packet compressed?
-            if data_len > 0 {
-                ensure!(
-                    data_len > self.threshold.0,
-                    "decompressed packet length of {data_len} is <= the compression threshold of \
-                     {}",
-                    self.threshold.0
-                );
-
-                debug_assert!(self.decompress_buf.is_empty());
-
-                self.decompress_buf.put_bytes(0, data_len as usize);
-
-                // TODO: use libdeflater or zune-inflate?
-                let mut z = ZlibDecoder::new(&mut self.decompress_buf[..]);
-
-                z.write_all(r)?;
+                let data_len = VarInt::decode(&mut r)?.0;
 
                 ensure!(
-                    z.finish()?.is_empty(),
-                    "decompressed packet length is shorter than expected"
+                    (0..MAX_PACKET_SIZE).contains(&data_len),
+                    "decompressed packet length of {data_len} is out of bounds"
                 );
 
-                let total_packet_len = VarInt(packet_len).written_size() + packet_len as usize;
+                if data_len > 0 {
+                    ensure!(
+                        data_len > self.threshold.0,
+                        "decompressed packet length of {data_len} is <= the compression threshold of \
+                         {}",
+                        self.threshold.0
+                    );
 
-                self.buf.advance(total_packet_len);
+                    debug_assert!(self.decompress_buf.is_empty());
 
-                data = self.decompress_buf.split();
+                    self.decompress_buf.put_bytes(0, data_len as usize);
+
+                    let mut z = ZlibDecoder::new(&mut self.decompress_buf[..]);
+                    z.write_all(r)?;
+
+                    ensure!(
+                        z.finish()?.is_empty(),
+                        "decompressed packet length is shorter than expected"
+                    );
+
+                    self.decompress_buf.split()
+                } else {
+                    debug_assert_eq!(data_len, 0);
+
+                    ensure!(
+                        r.len() <= self.threshold.0 as usize,
+                        "uncompressed packet length of {} exceeds compression threshold of {}",
+                        r.len(),
+                        self.threshold.0
+                    );
+
+                    BytesMut::from(r)
+                }
             } else {
-                debug_assert_eq!(data_len, 0);
-
-                ensure!(
-                    r.len() <= self.threshold.0 as usize,
-                    "uncompressed packet length of {} exceeds compression threshold of {}",
-                    r.len(),
-                    self.threshold.0
-                );
-
-                let remaining_len = r.len();
-
-                self.buf.advance(packet_len_len + 1);
-
-                data = self.buf.split_to(remaining_len);
+                BytesMut::from(r)
             }
-        } else {
-            self.buf.advance(packet_len_len);
-            data = self.buf.split_to(packet_len as usize);
-        }
 
-        #[cfg(not(feature = "compression"))]
-        {
-            self.buf.advance(packet_len_len);
-            data = self.buf.split_to(packet_len as usize);
-        }
+            #[cfg(not(feature = "compression"))]
+            {
+                BytesMut::from(r)
+            }
+        };
 
-        // Decode the leading packet ID.
-        r = &data[..];
+        let mut r = &data[..];
         let packet_id = VarInt::decode(&mut r)
             .context("failed to decode packet ID")?
             .0;
 
-        data.advance(data.len() - r.len());
-
-        Ok(Some(PacketFrame {
+        Ok(PacketFrame {
             id: packet_id,
-            body: data,
-        }))
+            body: BytesMut::from(r),
+        })
     }
 
     #[cfg(feature = "compression")]
@@ -208,6 +208,12 @@ pub struct PacketFrame {
     pub id: i32,
     /// The contents of the packet after the leading `VarInt` ID.
     pub body: BytesMut,
+}
+
+#[derive(Clone, Debug)]
+pub struct PacketFrameWithRaw {
+    pub frame: PacketFrame,
+    pub raw: BytesMut,
 }
 
 impl PacketFrame {

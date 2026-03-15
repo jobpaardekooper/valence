@@ -1,15 +1,17 @@
+mod connection_capture;
 mod packet_io;
 mod packet_registry;
 
 use std::borrow::Cow;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::bail;
 use bytes::{BufMut, BytesMut};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tokio::task::JoinHandle;
 use valence_binary::{Decode, Encode};
 use valence_protocol::decode::PacketFrame;
@@ -25,6 +27,7 @@ use valence_protocol::{
     CompressionThreshold, JsonText, Packet as ValencePacket, PacketSide, PacketState,
 };
 
+use crate::connection_capture::ConnectionCapture;
 use crate::packet_io::PacketIo;
 pub use crate::packet_registry::{Packet, PacketRegistry};
 
@@ -60,9 +63,30 @@ pub struct Proxy {
     pub packet_registry: Arc<RwLock<PacketRegistry>>,
 }
 
+#[derive(Clone, Debug)]
+pub struct ProxyOptions {
+    pub listener_addr: SocketAddr,
+    pub server_addr: SocketAddr,
+    pub capture: Option<CaptureOptions>,
+}
+
+#[derive(Clone, Debug)]
+pub struct CaptureOptions {
+    pub output_dir: PathBuf,
+}
+
 impl Proxy {
     /// Creates a new proxy, and starts its listener task.
     pub async fn start(listener_addr: SocketAddr, server_addr: SocketAddr) -> anyhow::Result<Self> {
+        Self::start_with_options(ProxyOptions {
+            listener_addr,
+            server_addr,
+            capture: None,
+        })
+        .await
+    }
+
+    pub async fn start_with_options(options: ProxyOptions) -> anyhow::Result<Self> {
         let (message_tx, message_rx) = flume::unbounded();
         let (logs_tx, logs_rx) = flume::unbounded();
 
@@ -74,8 +98,9 @@ impl Proxy {
 
         let main_task = tokio::spawn(Self::run_main_task(
             packet_registry.clone(),
-            TcpListener::bind(listener_addr).await?,
-            server_addr,
+            TcpListener::bind(options.listener_addr).await?,
+            options.server_addr,
+            options.capture,
             message_rx,
             logs_tx,
         ));
@@ -117,6 +142,7 @@ impl Proxy {
         packet_registry: Arc<RwLock<PacketRegistry>>,
         listener: TcpListener,
         server_addr: SocketAddr,
+        capture_options: Option<CaptureOptions>,
         message_rx: flume::Receiver<ProxyMessage>,
         logs_tx: flume::Sender<ProxyLog>,
     ) -> anyhow::Result<()> {
@@ -132,6 +158,7 @@ impl Proxy {
                         TcpStream::connect(server_addr).await?,
                         logs_tx.clone(),
                         packet_registry.clone(),
+                        capture_options.clone(),
                     )));
                 }
                 m = message_rx.recv_async() => match m {
@@ -157,6 +184,7 @@ impl Proxy {
         server: TcpStream,
         a_logs_tx: flume::Sender<ProxyLog>,
         packet_registry: Arc<RwLock<PacketRegistry>>,
+        capture_options: Option<CaptureOptions>,
     ) -> anyhow::Result<()> {
         let client_addr = client.peer_addr()?;
 
@@ -168,11 +196,16 @@ impl Proxy {
         let (mut server_reader, mut server_writer) = server.split(a_threshold.clone());
 
         let a_state = Arc::new(RwLock::new(PacketState::Handshake));
+        let capture = capture_options
+            .map(|options| ConnectionCapture::create(options.output_dir, client_addr))
+            .transpose()?
+            .map(|capture| Arc::new(Mutex::new(capture)));
 
         let registry = packet_registry.clone();
         let state_lock = a_state.clone();
         let threshold_lock = a_threshold.clone();
         let logs_tx = a_logs_tx.clone();
+        let capture_lock = capture.clone();
         let c2s = tokio::spawn(async move {
             loop {
                 // client to server handling
@@ -192,20 +225,26 @@ impl Proxy {
                 };
 
                 let state = *state_lock.read().await;
+                let threshold = *threshold_lock.read().await;
+
+                if let Some(capture) = &capture_lock {
+                    capture.lock().await.write_packet(
+                        PacketSide::Serverbound,
+                        state,
+                        threshold,
+                        packet.frame.id,
+                        &packet.raw,
+                    )?;
+                }
 
                 registry
                     .write()
                     .await
-                    .process(
-                        PacketSide::Serverbound,
-                        state,
-                        *threshold_lock.read().await,
-                        &packet,
-                    )
+                    .process(PacketSide::Serverbound, state, threshold, &packet.frame)
                     .await?;
 
                 if state == PacketState::Handshake {
-                    if let Some(handshake) = extrapolate_packet::<IntentionC2s>(&packet) {
+                    if let Some(handshake) = extrapolate_packet::<IntentionC2s>(&packet.frame) {
                         *state_lock.write().await = match handshake.intent {
                             HandShakeIntent::Status => PacketState::Status,
                             HandShakeIntent::Login => PacketState::Login,
@@ -214,23 +253,24 @@ impl Proxy {
                     }
                 }
                 if state == PacketState::Login
-                    && extrapolate_packet::<LoginAcknowledgedC2s>(&packet).is_some()
+                    && extrapolate_packet::<LoginAcknowledgedC2s>(&packet.frame).is_some()
                 {
                     *state_lock.write().await = PacketState::Configuration;
                 }
                 if state == PacketState::Play
-                    && extrapolate_packet::<play::ConfigurationAcknowledgedC2s>(&packet).is_some()
+                    && extrapolate_packet::<play::ConfigurationAcknowledgedC2s>(&packet.frame)
+                        .is_some()
                 {
                     *state_lock.write().await = PacketState::Configuration;
                 }
                 if state == PacketState::Configuration
-                    && extrapolate_packet::<configuration::FinishConfigurationC2s>(&packet)
+                    && extrapolate_packet::<configuration::FinishConfigurationC2s>(&packet.frame)
                         .is_some()
                 {
                     *state_lock.write().await = PacketState::Play;
                 }
 
-                server_writer.send_packet_raw(&packet).await?;
+                server_writer.send_packet_bytes(&packet.raw).await?;
             }
         });
 
@@ -238,6 +278,7 @@ impl Proxy {
         let state_lock = a_state.clone();
         let threshold_lock = a_threshold.clone();
         let logs_tx = a_logs_tx.clone();
+        let capture_lock = capture.clone();
         let s2c = tokio::spawn(async move {
             loop {
                 // server to client handling
@@ -250,22 +291,33 @@ impl Proxy {
                 };
 
                 let state = *state_lock.read().await;
+                let threshold = *threshold_lock.read().await;
+
+                if let Some(capture) = &capture_lock {
+                    capture.lock().await.write_packet(
+                        PacketSide::Clientbound,
+                        state,
+                        threshold,
+                        packet.frame.id,
+                        &packet.raw,
+                    )?;
+                }
 
                 registry
                     .write()
                     .await
-                    .process(
-                        PacketSide::Clientbound,
-                        state,
-                        *threshold_lock.read().await,
-                        &packet,
-                    )
+                    .process(PacketSide::Clientbound, state, threshold, &packet.frame)
                     .await?;
 
                 // (The check is done in this if rather than the one above, to still send the
                 // encryption request packet to the inspector)
-                if state == PacketState::Login && extrapolate_packet::<HelloS2c>(&packet).is_some()
+                if state == PacketState::Login
+                    && extrapolate_packet::<HelloS2c>(&packet.frame).is_some()
                 {
+                    if let Some(capture) = &capture_lock {
+                        capture.lock().await.mark_online_mode();
+                    }
+
                     // The server is requesting encryption, we can't support that
 
                     let disconnect_packet = LoginDisconnectS2c {
@@ -300,21 +352,44 @@ impl Proxy {
                     bail!("server is running in online mode");
                 }
 
-                client_writer.send_packet_raw(&packet).await?;
+                client_writer.send_packet_bytes(&packet.raw).await?;
 
                 if state == PacketState::Login {
-                    if let Some(LoginCompressionS2c { threshold }) = extrapolate_packet(&packet) {
+                    if let Some(LoginCompressionS2c { threshold }) =
+                        extrapolate_packet(&packet.frame)
+                    {
                         *threshold_lock.write().await = CompressionThreshold(threshold.0);
                     }
                 }
             }
         });
 
-        // wait for either to finish
-        tokio::select! {
-            res = c2s => res?,
-            res = s2c => res?,
+        let mut c2s = c2s;
+        let mut s2c = s2c;
+
+        let result = tokio::select! {
+            res = &mut c2s => {
+                s2c.abort();
+                let _ = s2c.await;
+                res?
+            }
+            res = &mut s2c => {
+                c2s.abort();
+                let _ = c2s.await;
+                res?
+            }
+        };
+
+        if let Some(capture) = capture {
+            let final_threshold = *a_threshold.read().await;
+            if let Ok(capture) = Arc::try_unwrap(capture) {
+                if let Err(err) = capture.into_inner().finish(final_threshold) {
+                    tracing::error!("failed to finalize capture for {client_addr}: {err:#}");
+                }
+            }
         }
+
+        result
     }
 }
 

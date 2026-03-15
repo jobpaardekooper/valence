@@ -8,7 +8,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::RwLock;
 use valence_binary::Encode;
-use valence_protocol::decode::{PacketDecoder, PacketFrame};
+use valence_protocol::decode::{PacketDecoder, PacketFrame, PacketFrameWithRaw};
 use valence_protocol::encode::PacketEncoder;
 use valence_protocol::{CompressionThreshold, VarInt, MAX_PACKET_SIZE};
 
@@ -19,15 +19,12 @@ pub(crate) struct PacketIoReader {
 }
 
 impl PacketIoReader {
-    pub(crate) async fn recv_packet_raw(&mut self) -> anyhow::Result<PacketFrame> {
+    pub(crate) async fn recv_packet_raw(&mut self) -> anyhow::Result<PacketFrameWithRaw> {
         loop {
             let threshold = *self.threshold.read().await;
             self.dec.set_compression(threshold);
 
-            if let Some(frame) = self.dec.try_next_packet()? {
-                // self.logger
-                //     .log("Unknown".to_string(), self.direction.clone(), frame.clone());
-
+            if let Some(frame) = self.dec.try_next_packet_with_raw()? {
                 return Ok(frame);
             }
 
@@ -135,6 +132,12 @@ impl PacketIoWriter {
 
         self.writer.write_all(&bytes).await?;
 
+        Ok(())
+    }
+
+    pub(crate) async fn send_packet_bytes(&mut self, bytes: &[u8]) -> anyhow::Result<()> {
+        self.writer.write_all(bytes).await?;
+        self.writer.flush().await?;
         Ok(())
     }
 

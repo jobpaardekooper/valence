@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::RwLock;
 
 use egui::Context;
@@ -52,6 +53,8 @@ pub(crate) struct SharedState {
     pub(crate) listener_addr: String,
     pub(crate) server_addr: String,
     pub(crate) autostart: bool,
+    pub(crate) save_captures: bool,
+    pub(crate) capture_dir: String,
     pub(crate) packet_filter: PacketFilter,
     pub(crate) packet_search: String,
     #[serde(skip)]
@@ -80,6 +83,8 @@ impl Default for SharedState {
             listener_addr: "127.0.0.1:25566".to_owned(),
             server_addr: "127.0.0.1:25565".to_owned(),
             autostart: false,
+            save_captures: false,
+            capture_dir: default_capture_dir(),
             is_listening: false,
             packet_search: String::new(),
             packet_filter: PacketFilter::new(),
@@ -92,6 +97,13 @@ impl Default for SharedState {
             ctx: None,
         }
     }
+}
+
+fn default_capture_dir() -> String {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../crates/valence_protocol/captures")
+        .to_string_lossy()
+        .into_owned()
 }
 
 #[allow(unused)]

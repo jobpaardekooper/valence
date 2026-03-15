@@ -1,8 +1,9 @@
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
 use egui_dock::{DockArea, DockState, NodeIndex, Style};
-use packet_inspector::Proxy;
+use packet_inspector::{CaptureOptions, Proxy, ProxyOptions};
 use tokio::task::JoinHandle;
 
 use crate::shared_state::{Event, SharedState};
@@ -160,11 +161,19 @@ fn handle_events(state: Arc<RwLock<SharedState>>) {
                         w_state.is_listening = false;
                         continue;
                     };
+                    let capture = w_state.save_captures.then(|| CaptureOptions {
+                        output_dir: PathBuf::from(&w_state.capture_dir),
+                    });
 
                     let state = state.clone();
 
                     proxy_thread = Some(tokio::spawn(async move {
-                        let proxy = Proxy::start(listener_addr, server_addr).await?;
+                        let proxy = Proxy::start_with_options(ProxyOptions {
+                            listener_addr,
+                            server_addr,
+                            capture,
+                        })
+                        .await?;
                         let receiver = proxy.subscribe().await;
 
                         while let Ok(packet) = receiver.recv_async().await {

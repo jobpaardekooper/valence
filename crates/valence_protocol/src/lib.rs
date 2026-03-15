@@ -1,5 +1,6 @@
 #![doc = include_str!("../README.md")]
 #![allow(deprecated)] // TODO: update aes library
+#![recursion_limit = "4096"]
 
 /// Used only by macros. Not public API.
 #[doc(hidden)]
@@ -14,6 +15,7 @@ extern crate self as valence_protocol;
 mod biome_pos;
 mod bit_storage;
 pub mod block_pos;
+pub mod capture;
 pub mod chunk_pos;
 pub mod chunk_section_pos;
 pub mod decode;
@@ -306,3 +308,6 @@ mod tests {
         check_test_packet(&mut dec, "third");
     }
 }
+
+#[cfg(all(test, feature = "compression"))]
+mod capture_replay_tests;
