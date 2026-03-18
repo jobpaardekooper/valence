@@ -19,6 +19,7 @@ pub fn main() {
             (
                 init_clients,
                 despawn_disconnected_clients,
+                manage_chunks.after(init_clients).before(digging),
                 toggle_gamemode_on_sneak,
                 digging,
                 place_blocks,
@@ -101,6 +102,19 @@ fn toggle_gamemode_on_sneak(
                 GameMode::Creative => GameMode::Survival,
                 _ => GameMode::Creative,
             };
+        }
+    }
+}
+
+fn manage_chunks(
+    clients: Query<(&Position, &ViewDistance), With<Client>>,
+    mut layers: Query<&mut ChunkLayer>,
+) {
+    let mut layer = layers.single_mut();
+
+    for (pos, view_dist) in &clients {
+        for pos in ChunkView::new(pos.0.into(), view_dist.get()).iter() {
+            layer.chunk_entry(pos).or_default();
         }
     }
 }
