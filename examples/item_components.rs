@@ -1,9 +1,11 @@
 use valence::entity::attributes::EntityAttributeOperation;
+use valence::inventory::ClickSlotEvent;
 use valence::item::{
     AttributeModifier, AttributeSlot, ConsumableAnimation, EquipSlot, ItemComponent,
     ResolvableProfile, SoundEventDefinition,
 };
 use valence::prelude::*;
+use valence::protocol::text::TextContent;
 use valence::protocol::IntoTextComponent;
 use valence_binary::{IdOr, VarInt};
 
@@ -12,6 +14,14 @@ fn main() {
         .add_plugins(DefaultPlugins)
         .add_systems(Startup, setup)
         .add_systems(Update, (init_clients, despawn_disconnected_clients))
+        .add_systems(
+            Update,
+            (
+                init_clients,
+                report_probe_clicks,
+                despawn_disconnected_clients,
+            ),
+        )
         .run();
 }
 
@@ -47,6 +57,7 @@ fn init_clients(
             &mut Position,
             &mut GameMode,
             &mut Inventory,
+            &mut Client,
         ),
         Added<Client>,
     >,
@@ -59,6 +70,7 @@ fn init_clients(
         mut pos,
         mut game_mode,
         mut inventory,
+        mut client,
     ) in &mut clients
     {
         let layer = layers.single();
@@ -178,5 +190,84 @@ fn init_clients(
                 },
             ]),
         );
+
+        let duplicate_bug_marker = "Try this: pick up the Probe A sword, then click Probe B.";
+        client.send_chat_message(duplicate_bug_marker);
+        client.send_chat_message(
+            "If component hashes are ignored, both stacks can become Probe A instead of swapping.",
+        );
+
+        inventory.set_slot(
+            43,
+            ItemStack::new(ItemKind::IronSword, 1).with_components(vec![
+                ItemComponent::ItemName("Probe A - red name".into_text_component()),
+                ItemComponent::Lore(vec![
+                    "Same item/count as Probe B".into_text_component(),
+                    "Component payload A".into_text_component(),
+                ]),
+                ItemComponent::DyedColor { color: 0xff0000 },
+            ]),
+        );
+
+        inventory.set_slot(
+            44,
+            ItemStack::new(ItemKind::IronSword, 1).with_components(vec![
+                ItemComponent::ItemName("Probe B - blue name".into_text_component()),
+                ItemComponent::Lore(vec![
+                    "Same item/count as Probe A".into_text_component(),
+                    "Component payload B".into_text_component(),
+                ]),
+                ItemComponent::DyedColor { color: 0x0000ff },
+            ]),
+        );
     }
+}
+
+fn report_probe_clicks(
+    mut events: EventReader<ClickSlotEvent>,
+    mut clients: Query<(&mut Client, &Inventory, &CursorItem)>,
+) {
+    for event in events.read() {
+        let touched_probe_slot = event.slot_id == 43
+            || event.slot_id == 44
+            || event
+                .slot_changes
+                .iter()
+                .any(|change| change.idx == 43 || change.idx == 44);
+
+        if !touched_probe_slot {
+            continue;
+        }
+
+        let Ok((mut client, inventory, cursor)) = clients.get_mut(event.client) else {
+            continue;
+        };
+
+        client.send_chat_message(format!(
+            "Server state: slot 43 = {}, slot 44 = {}, cursor = {}",
+            probe_label(inventory.slot(43)),
+            probe_label(inventory.slot(44)),
+            probe_label(&cursor.0),
+        ));
+    }
+}
+
+fn probe_label(stack: &ItemStack) -> String {
+    if stack.is_empty() {
+        return "empty".to_owned();
+    }
+
+    let name = stack
+        .components()
+        .into_iter()
+        .find_map(|component| match component {
+            ItemComponent::ItemName(name) => match &name.as_text().content {
+                TextContent::Text { text } => Some(text.as_ref().to_owned()),
+                _ => Some(name.as_text().to_string()),
+            },
+            _ => None,
+        })
+        .unwrap_or_else(|| format!("{:?}", stack.item));
+
+    format!("{name} x{}", stack.count)
 }
