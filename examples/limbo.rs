@@ -30,13 +30,19 @@ const BLOCK_TYPES: [BlockState; 7] = [
 
 pub fn main() {
     let proxy_secret = env::var("PROXY_SECRET");
+    let limbo_port = env::var("LIMBO_PORT");
+    let port_number = limbo_port
+        .as_deref()
+        .unwrap_or("25565")
+        .parse::<u16>()
+        .unwrap_or(25565);
 
     App::new()
         .insert_resource(NetworkSettings {
             callbacks: CustomNetworkCallbacks.into(),
             max_connections: 1024,
             max_players: 1024,
-            address: SocketAddr::from(([0, 0, 0, 0], 25565)),
+            address: SocketAddr::from(([0, 0, 0, 0], port_number)),
             connection_mode: match proxy_secret {
                 Ok(secret) => ConnectionMode::Velocity {
                     secret: Arc::from(secret),
