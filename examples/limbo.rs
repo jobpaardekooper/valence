@@ -118,11 +118,15 @@ struct GameState {
 #[derive(Component)]
 struct ScoreboardOwner(Entity);
 
-const HIGH_SCORE_LABEL: &str = "";
+const HIGH_SCORE_LABEL: &str = "Your best:";
+const GLOBAL_HIGH_SCORE_LABEL: &str = "Server wide best:";
 const HIGH_SCORE_DIR: &str = "highscores";
 
 fn high_score_scores(high_score: u32) -> ObjectiveScores {
-    ObjectiveScores::with_map([(HIGH_SCORE_LABEL.to_owned(), high_score as i32)])
+    ObjectiveScores::with_map([
+        (HIGH_SCORE_LABEL.to_owned(), high_score as i32),
+        (GLOBAL_HIGH_SCORE_LABEL.to_owned(), 0),
+    ])
 }
 
 fn load_or_create_high_score(uuid: UniqueId) -> (PathBuf, u32) {
@@ -210,7 +214,7 @@ fn init_clients(
                 ScoreboardOwner(entity),
                 ObjectiveBundle {
                     name: Objective::new("limbo-high"),
-                    display: ObjectiveDisplay("High Score".into_text()),
+                    display: ObjectiveDisplay("Scores".into_text()),
                     scores: high_score_scores(high_score),
                     layer: EntityLayerId(scoreboard_layer),
                     ..Default::default()
