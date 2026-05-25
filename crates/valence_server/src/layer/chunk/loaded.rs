@@ -462,11 +462,15 @@ impl LoadedChunk {
     ) {
         match light {
             LightSection::NotSet => {
-                // For sky light, the client will deduce this section to be either fully lit or
-                // fully dark based on the presence of light data in other light sections in the
-                // chunk.
                 if is_block_light {
                     empty_light_mask.set(i, 1);
+                } else {
+                    // Valence does not have a lighting engine yet, so make the
+                    // default skylight explicit. Leaving this unset relies on
+                    // client inference, which can break when a proxy rewrites
+                    // chunk/light data for a newer protocol.
+                    light_arrays.push(FixedArray([0xff; 2048]));
+                    light_mask.set(i, 1);
                 }
             }
             LightSection::FullyDark => {
@@ -599,7 +603,7 @@ impl LoadedChunk {
                     block_entities: Cow::Owned(block_entities),
                     sky_light_mask: Cow::Borrowed(&sky_light_mask.into_data()),
                     block_light_mask: Cow::Borrowed(&block_light_mask.into_data()),
-                    empty_sky_light_mask: Cow::Borrowed(&[]),
+                    empty_sky_light_mask: Cow::Borrowed(&empty_sky_light_mask.into_data()),
                     empty_block_light_mask: Cow::Borrowed(&empty_block_light_mask.into_data()),
                     sky_light_arrays: Cow::Borrowed(&sky_light_arrays),
                     block_light_arrays: Cow::Borrowed(&block_light_arrays),
