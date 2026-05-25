@@ -65,6 +65,7 @@ pub fn main() {
             ..Default::default()
         })
         .add_plugins(DefaultPlugins)
+        .add_systems(Startup, setup_high_score_storage)
         .add_systems(
             Update,
             (
@@ -121,39 +122,57 @@ struct ScoreboardOwner(Entity);
 const HIGH_SCORE_LABEL: &str = "Your best:";
 const GLOBAL_HIGH_SCORE_LABEL: &str = "Server wide best:";
 const HIGH_SCORE_DIR: &str = "highscores";
+const GLOBAL_HIGH_SCORE_FILE: &str = "server.txt";
 
-fn high_score_scores(high_score: u32) -> ObjectiveScores {
+#[derive(Resource)]
+struct GlobalHighScore {
+    score: u32,
+    path: PathBuf,
+}
+
+fn high_score_scores(high_score: u32, global_high_score: u32) -> ObjectiveScores {
     ObjectiveScores::with_map([
         (HIGH_SCORE_LABEL.to_owned(), high_score as i32),
-        (GLOBAL_HIGH_SCORE_LABEL.to_owned(), 0),
+        (GLOBAL_HIGH_SCORE_LABEL.to_owned(), global_high_score as i32),
     ])
+}
+
+fn setup_high_score_storage(mut commands: Commands) {
+    if let Err(err) = fs::create_dir_all(HIGH_SCORE_DIR) {
+        eprintln!("failed to create high score directory: {err}");
+    }
+
+    let path = PathBuf::from(HIGH_SCORE_DIR).join(GLOBAL_HIGH_SCORE_FILE);
+    let score = load_or_create_score(&path, "server-wide high score");
+
+    commands.insert_resource(GlobalHighScore { score, path });
 }
 
 fn load_or_create_high_score(uuid: UniqueId) -> (PathBuf, u32) {
     let path = PathBuf::from(HIGH_SCORE_DIR).join(format!("{}.txt", uuid.0));
+    let score = load_or_create_score(&path, "player high score");
 
-    if let Err(err) = fs::create_dir_all(HIGH_SCORE_DIR) {
-        eprintln!("failed to create high score directory: {err}");
-        return (path, 0);
-    }
+    (path, score)
+}
 
+fn load_or_create_score(path: &PathBuf, name: &str) -> u32 {
     match fs::read_to_string(&path) {
         Ok(score) => match score.trim().parse() {
-            Ok(score) => (path, score),
+            Ok(score) => score,
             Err(err) => {
-                eprintln!("failed to parse high score from {}: {err}", path.display());
-                (path, 0)
+                eprintln!("failed to parse {name} from {}: {err}", path.display());
+                0
             }
         },
         Err(err) if err.kind() == io::ErrorKind::NotFound => {
             if let Err(err) = fs::write(&path, "0\n") {
-                eprintln!("failed to create high score file {}: {err}", path.display());
+                eprintln!("failed to create {name} file {}: {err}", path.display());
             }
-            (path, 0)
+            0
         }
         Err(err) => {
-            eprintln!("failed to read high score from {}: {err}", path.display());
-            (path, 0)
+            eprintln!("failed to read {name} from {}: {err}", path.display());
+            0
         }
     }
 }
@@ -163,6 +182,18 @@ fn save_high_score(state: &GameState) {
         eprintln!(
             "failed to write high score to {}: {err}",
             state.high_score_path.display()
+        );
+    }
+}
+
+fn save_global_high_score(global_high_score: &GlobalHighScore) {
+    if let Err(err) = fs::write(
+        &global_high_score.path,
+        format!("{}\n", global_high_score.score),
+    ) {
+        eprintln!(
+            "failed to write server-wide high score to {}: {err}",
+            global_high_score.path.display()
         );
     }
 }
@@ -183,6 +214,7 @@ fn init_clients(
     server: Res<Server>,
     dimensions: Res<DimensionTypeRegistry>,
     biomes: Res<BiomeRegistry>,
+    global_high_score: Res<GlobalHighScore>,
     mut commands: Commands,
 ) {
     for (
@@ -215,7 +247,7 @@ fn init_clients(
                 ObjectiveBundle {
                     name: Objective::new("limbo-high"),
                     display: ObjectiveDisplay("Scores".into_text()),
-                    scores: high_score_scores(high_score),
+                    scores: high_score_scores(high_score, global_high_score.score),
                     layer: EntityLayerId(scoreboard_layer),
                     ..Default::default()
                 },
@@ -247,7 +279,8 @@ fn reset_clients(
         &mut GameState,
         &mut ChunkLayer,
     )>,
-    mut objective_scores: Query<&mut ObjectiveScores>,
+    mut global_high_score: ResMut<GlobalHighScore>,
+    mut objective_scores: Query<&mut ObjectiveScores, With<ScoreboardOwner>>,
 ) {
     for (mut client, mut pos, mut look, mut state, mut layer) in &mut clients {
         let out_of_bounds = (pos.0.y as i32) < START_POS.y - 32;
@@ -268,7 +301,13 @@ fn reset_clients(
             if state.score > state.high_score {
                 state.high_score = state.score;
                 save_high_score(&state);
-                update_high_score_objective(&state, &mut objective_scores);
+                update_high_score_objective(&state, &global_high_score, &mut objective_scores);
+            }
+
+            if state.score > global_high_score.score {
+                global_high_score.score = state.score;
+                save_global_high_score(&global_high_score);
+                update_global_high_score_objectives(&global_high_score, &mut objective_scores);
             }
 
             // Init chunks.
@@ -303,7 +342,8 @@ fn reset_clients(
 
 fn manage_blocks(
     mut clients: Query<(&mut Client, &Position, &mut GameState, &mut ChunkLayer)>,
-    mut objective_scores: Query<&mut ObjectiveScores>,
+    mut global_high_score: ResMut<GlobalHighScore>,
+    mut objective_scores: Query<&mut ObjectiveScores, With<ScoreboardOwner>>,
 ) {
     for (mut client, pos, mut state, mut layer) in &mut clients {
         let pos_under_player = BlockPos::new(
@@ -339,7 +379,13 @@ fn manage_blocks(
                 if state.score > state.high_score {
                     state.high_score = state.score;
                     save_high_score(&state);
-                    update_high_score_objective(&state, &mut objective_scores);
+                    update_high_score_objective(&state, &global_high_score, &mut objective_scores);
+                }
+
+                if state.score > global_high_score.score {
+                    global_high_score.score = state.score;
+                    save_global_high_score(&global_high_score);
+                    update_global_high_score_objectives(&global_high_score, &mut objective_scores);
                 }
 
                 let pitch = 0.9 + ((state.combo as f32) - 1.0) * 0.05;
@@ -360,10 +406,21 @@ fn manage_blocks(
 
 fn update_high_score_objective(
     state: &GameState,
-    objective_scores: &mut Query<&mut ObjectiveScores>,
+    global_high_score: &GlobalHighScore,
+    objective_scores: &mut Query<&mut ObjectiveScores, With<ScoreboardOwner>>,
 ) {
     if let Ok(mut scores) = objective_scores.get_mut(state.scoreboard_objective) {
         scores.insert(HIGH_SCORE_LABEL, state.high_score as i32);
+        scores.insert(GLOBAL_HIGH_SCORE_LABEL, global_high_score.score as i32);
+    }
+}
+
+fn update_global_high_score_objectives(
+    global_high_score: &GlobalHighScore,
+    objective_scores: &mut Query<&mut ObjectiveScores, With<ScoreboardOwner>>,
+) {
+    for mut scores in objective_scores {
+        scores.insert(GLOBAL_HIGH_SCORE_LABEL, global_high_score.score as i32);
     }
 }
 
