@@ -5,7 +5,7 @@ use std::env;
 use std::fs;
 use std::io;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -73,6 +73,7 @@ pub fn main() {
                 reset_clients.after(init_clients),
                 manage_chunks.after(reset_clients).before(manage_blocks),
                 manage_blocks,
+                update_global_high_score_scoreboards.after(manage_blocks),
                 despawn_disconnected_clients,
                 cleanup_disconnected_scoreboards.after(despawn_disconnected_clients),
             ),
@@ -121,19 +122,33 @@ struct ScoreboardOwner(Entity);
 
 const HIGH_SCORE_LABEL: &str = "Your best:";
 const GLOBAL_HIGH_SCORE_LABEL: &str = "Server wide best:";
+const GLOBAL_HIGH_SCORE_PLAYER_LABEL: &str = "Best player:";
+const SCOREBOARD_EMPTY_LINE: &str = " ";
 const HIGH_SCORE_DIR: &str = "highscores";
-const GLOBAL_HIGH_SCORE_FILE: &str = "server.txt";
+const GLOBAL_HIGH_SCORE_FILE: &str = "server.csv";
 
 #[derive(Resource)]
 struct GlobalHighScore {
     score: u32,
+    player_name: String,
     path: PathBuf,
 }
 
-fn high_score_scores(high_score: u32, global_high_score: u32) -> ObjectiveScores {
+fn high_score_scores(high_score: u32, global_high_score: &GlobalHighScore) -> ObjectiveScores {
+    let player_name = if global_high_score.player_name.is_empty() {
+        "Nobody yet"
+    } else {
+        &global_high_score.player_name
+    };
+
     ObjectiveScores::with_map([
-        (HIGH_SCORE_LABEL.to_owned(), high_score as i32),
-        (GLOBAL_HIGH_SCORE_LABEL.to_owned(), global_high_score as i32),
+        (
+            format!("{GLOBAL_HIGH_SCORE_LABEL} {}", global_high_score.score),
+            4,
+        ),
+        (format!("{GLOBAL_HIGH_SCORE_PLAYER_LABEL} {player_name}"), 3),
+        (SCOREBOARD_EMPTY_LINE.to_owned(), 2),
+        (format!("{HIGH_SCORE_LABEL} {high_score}"), 1),
     ])
 }
 
@@ -143,9 +158,13 @@ fn setup_high_score_storage(mut commands: Commands) {
     }
 
     let path = PathBuf::from(HIGH_SCORE_DIR).join(GLOBAL_HIGH_SCORE_FILE);
-    let score = load_or_create_score(&path, "server-wide high score");
+    let (score, player_name) = load_or_create_global_high_score(&path);
 
-    commands.insert_resource(GlobalHighScore { score, path });
+    commands.insert_resource(GlobalHighScore {
+        score,
+        player_name,
+        path,
+    });
 }
 
 fn load_or_create_high_score(uuid: UniqueId) -> (PathBuf, u32) {
@@ -155,7 +174,7 @@ fn load_or_create_high_score(uuid: UniqueId) -> (PathBuf, u32) {
     (path, score)
 }
 
-fn load_or_create_score(path: &PathBuf, name: &str) -> u32 {
+fn load_or_create_score(path: &Path, name: &str) -> u32 {
     match fs::read_to_string(&path) {
         Ok(score) => match score.trim().parse() {
             Ok(score) => score,
@@ -177,6 +196,43 @@ fn load_or_create_score(path: &PathBuf, name: &str) -> u32 {
     }
 }
 
+fn load_or_create_global_high_score(path: &Path) -> (u32, String) {
+    match fs::read_to_string(path) {
+        Ok(csv) => parse_global_high_score_csv(&csv).unwrap_or_else(|| {
+            eprintln!(
+                "failed to parse server-wide high score from {}",
+                path.display()
+            );
+            (0, String::new())
+        }),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            if let Err(err) = fs::write(path, "score,player\n0,\n") {
+                eprintln!(
+                    "failed to create server-wide high score file {}: {err}",
+                    path.display()
+                );
+            }
+            (0, String::new())
+        }
+        Err(err) => {
+            eprintln!(
+                "failed to read server-wide high score from {}: {err}",
+                path.display()
+            );
+            (0, String::new())
+        }
+    }
+}
+
+fn parse_global_high_score_csv(csv: &str) -> Option<(u32, String)> {
+    let line = csv
+        .lines()
+        .find(|line| !line.trim().is_empty() && !line.trim_start().starts_with("score,"))?;
+    let (score, player_name) = line.split_once(',')?;
+
+    Some((score.trim().parse().ok()?, player_name.trim().to_owned()))
+}
+
 fn save_high_score(state: &GameState) {
     if let Err(err) = fs::write(&state.high_score_path, format!("{}\n", state.high_score)) {
         eprintln!(
@@ -189,7 +245,10 @@ fn save_high_score(state: &GameState) {
 fn save_global_high_score(global_high_score: &GlobalHighScore) {
     if let Err(err) = fs::write(
         &global_high_score.path,
-        format!("{}\n", global_high_score.score),
+        format!(
+            "score,player\n{},{}\n",
+            global_high_score.score, global_high_score.player_name
+        ),
     ) {
         eprintln!(
             "failed to write server-wide high score to {}: {err}",
@@ -247,7 +306,7 @@ fn init_clients(
                 ObjectiveBundle {
                     name: Objective::new("limbo-high"),
                     display: ObjectiveDisplay("Scores".into_text()),
-                    scores: high_score_scores(high_score, global_high_score.score),
+                    scores: high_score_scores(high_score, &global_high_score),
                     layer: EntityLayerId(scoreboard_layer),
                     ..Default::default()
                 },
@@ -274,6 +333,7 @@ fn init_clients(
 fn reset_clients(
     mut clients: Query<(
         &mut Client,
+        &Username,
         &mut Position,
         &mut Look,
         &mut GameState,
@@ -282,7 +342,7 @@ fn reset_clients(
     mut global_high_score: ResMut<GlobalHighScore>,
     mut objective_scores: Query<&mut ObjectiveScores, With<ScoreboardOwner>>,
 ) {
-    for (mut client, mut pos, mut look, mut state, mut layer) in &mut clients {
+    for (mut client, username, mut pos, mut look, mut state, mut layer) in &mut clients {
         let out_of_bounds = (pos.0.y as i32) < START_POS.y - 32;
 
         if out_of_bounds || state.is_added() {
@@ -306,8 +366,8 @@ fn reset_clients(
 
             if state.score > global_high_score.score {
                 global_high_score.score = state.score;
+                global_high_score.player_name = username.0.clone();
                 save_global_high_score(&global_high_score);
-                update_global_high_score_objectives(&global_high_score, &mut objective_scores);
             }
 
             // Init chunks.
@@ -341,11 +401,17 @@ fn reset_clients(
 }
 
 fn manage_blocks(
-    mut clients: Query<(&mut Client, &Position, &mut GameState, &mut ChunkLayer)>,
+    mut clients: Query<(
+        &mut Client,
+        &Username,
+        &Position,
+        &mut GameState,
+        &mut ChunkLayer,
+    )>,
     mut global_high_score: ResMut<GlobalHighScore>,
     mut objective_scores: Query<&mut ObjectiveScores, With<ScoreboardOwner>>,
 ) {
-    for (mut client, pos, mut state, mut layer) in &mut clients {
+    for (mut client, username, pos, mut state, mut layer) in &mut clients {
         let pos_under_player = BlockPos::new(
             (pos.0.x - 0.5).round() as i32,
             pos.0.y as i32 - 1,
@@ -384,8 +450,8 @@ fn manage_blocks(
 
                 if state.score > global_high_score.score {
                     global_high_score.score = state.score;
+                    global_high_score.player_name = username.0.clone();
                     save_global_high_score(&global_high_score);
-                    update_global_high_score_objectives(&global_high_score, &mut objective_scores);
                 }
 
                 let pitch = 0.9 + ((state.combo as f32) - 1.0) * 0.05;
@@ -410,17 +476,21 @@ fn update_high_score_objective(
     objective_scores: &mut Query<&mut ObjectiveScores, With<ScoreboardOwner>>,
 ) {
     if let Ok(mut scores) = objective_scores.get_mut(state.scoreboard_objective) {
-        scores.insert(HIGH_SCORE_LABEL, state.high_score as i32);
-        scores.insert(GLOBAL_HIGH_SCORE_LABEL, global_high_score.score as i32);
+        *scores = high_score_scores(state.high_score, global_high_score);
     }
 }
 
-fn update_global_high_score_objectives(
-    global_high_score: &GlobalHighScore,
-    objective_scores: &mut Query<&mut ObjectiveScores, With<ScoreboardOwner>>,
+fn update_global_high_score_scoreboards(
+    global_high_score: Res<GlobalHighScore>,
+    clients: Query<&GameState, With<Client>>,
+    mut objective_scores: Query<&mut ObjectiveScores, With<ScoreboardOwner>>,
 ) {
-    for mut scores in objective_scores {
-        scores.insert(GLOBAL_HIGH_SCORE_LABEL, global_high_score.score as i32);
+    if !global_high_score.is_changed() {
+        return;
+    }
+
+    for state in &clients {
+        update_high_score_objective(state, &global_high_score, &mut objective_scores);
     }
 }
 
