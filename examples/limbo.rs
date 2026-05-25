@@ -37,6 +37,8 @@ pub fn main() {
         .parse::<u16>()
         .unwrap_or(25565);
 
+    println!("Starting Limbo on port {port_number}...");
+
     App::new()
         .insert_resource(NetworkSettings {
             callbacks: CustomNetworkCallbacks.into(),
