@@ -2,7 +2,10 @@
 
 use std::collections::VecDeque;
 use std::env;
+use std::fs;
+use std::io;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -109,15 +112,55 @@ struct GameState {
     target_y: i32,
     last_block_timestamp: u128,
     scoreboard_objective: Entity,
+    high_score_path: PathBuf,
 }
 
 #[derive(Component)]
 struct ScoreboardOwner(Entity);
 
 const HIGH_SCORE_LABEL: &str = "";
+const HIGH_SCORE_DIR: &str = "highscores";
 
 fn high_score_scores(high_score: u32) -> ObjectiveScores {
     ObjectiveScores::with_map([(HIGH_SCORE_LABEL.to_owned(), high_score as i32)])
+}
+
+fn load_or_create_high_score(uuid: UniqueId) -> (PathBuf, u32) {
+    let path = PathBuf::from(HIGH_SCORE_DIR).join(format!("{}.txt", uuid.0));
+
+    if let Err(err) = fs::create_dir_all(HIGH_SCORE_DIR) {
+        eprintln!("failed to create high score directory: {err}");
+        return (path, 0);
+    }
+
+    match fs::read_to_string(&path) {
+        Ok(score) => match score.trim().parse() {
+            Ok(score) => (path, score),
+            Err(err) => {
+                eprintln!("failed to parse high score from {}: {err}", path.display());
+                (path, 0)
+            }
+        },
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            if let Err(err) = fs::write(&path, "0\n") {
+                eprintln!("failed to create high score file {}: {err}", path.display());
+            }
+            (path, 0)
+        }
+        Err(err) => {
+            eprintln!("failed to read high score from {}: {err}", path.display());
+            (path, 0)
+        }
+    }
+}
+
+fn save_high_score(state: &GameState) {
+    if let Err(err) = fs::write(&state.high_score_path, format!("{}\n", state.high_score)) {
+        eprintln!(
+            "failed to write high score to {}: {err}",
+            state.high_score_path.display()
+        );
+    }
 }
 
 fn init_clients(
@@ -125,6 +168,7 @@ fn init_clients(
         (
             Entity,
             &mut Client,
+            &UniqueId,
             &mut VisibleChunkLayer,
             &mut VisibleEntityLayers,
             &mut IsFlat,
@@ -140,6 +184,7 @@ fn init_clients(
     for (
         entity,
         mut client,
+        uuid,
         mut visible_chunk_layer,
         mut visible_entity_layers,
         mut is_flat,
@@ -153,6 +198,8 @@ fn init_clients(
         client.send_chat_message("Welcome to the libmo!".color(Yellow));
         client.send_chat_message("You will be automatically reconnected to the server you tried to join once it becomes available.".color(Red).bold());
 
+        let (high_score_path, high_score) = load_or_create_high_score(*uuid);
+
         let scoreboard_layer = commands
             .spawn((EntityLayer::new(&server), ScoreboardOwner(entity)))
             .id();
@@ -164,7 +211,7 @@ fn init_clients(
                 ObjectiveBundle {
                     name: Objective::new("limbo-high"),
                     display: ObjectiveDisplay("High Score".into_text()),
-                    scores: high_score_scores(0),
+                    scores: high_score_scores(high_score),
                     layer: EntityLayerId(scoreboard_layer),
                     ..Default::default()
                 },
@@ -174,11 +221,12 @@ fn init_clients(
         let state = GameState {
             blocks: VecDeque::new(),
             score: 0,
-            high_score: 0,
+            high_score,
             combo: 0,
             target_y: 0,
             last_block_timestamp: 0,
             scoreboard_objective,
+            high_score_path,
         };
 
         let layer = ChunkLayer::new(ident!("overworld"), &dimensions, &biomes, &server);
@@ -213,8 +261,11 @@ fn reset_clients(
                 );
             }
 
-            state.high_score = state.high_score.max(state.score);
-            update_high_score_objective(&state, &mut objective_scores);
+            if state.score > state.high_score {
+                state.high_score = state.score;
+                save_high_score(&state);
+                update_high_score_objective(&state, &mut objective_scores);
+            }
 
             // Init chunks.
             for pos in ChunkView::new(START_POS.into(), VIEW_DIST).iter() {
@@ -283,6 +334,7 @@ fn manage_blocks(
 
                 if state.score > state.high_score {
                     state.high_score = state.score;
+                    save_high_score(&state);
                     update_high_score_objective(&state, &mut objective_scores);
                 }
 
