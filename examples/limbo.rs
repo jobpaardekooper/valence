@@ -1,14 +1,17 @@
 #![allow(clippy::type_complexity)]
 
 use std::collections::VecDeque;
+use std::env;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rand::seq::SliceRandom;
 use rand::Rng;
-use valence::prelude::*;
 use valence::protocol::sound::{Sound, SoundCategory};
 use valence::spawn::IsFlat;
+use valence::{prelude::*, MINECRAFT_VERSION, PROTOCOL_VERSION};
+use valence_network::{async_trait, HandshakeData, ServerListPing};
 use valence_scoreboard::{Objective, ObjectiveBundle, ObjectiveDisplay, ObjectiveScores};
 use valence_text::color::NamedColor::{Red, Yellow};
 
@@ -26,16 +29,21 @@ const BLOCK_TYPES: [BlockState; 7] = [
 ];
 
 pub fn main() {
+    let proxy_secret = env::var("PROXY_SECRET");
+
     App::new()
         .insert_resource(NetworkSettings {
-            // // connection_mode: ConnectionMode::Velocity {
-            // //     secret: Arc::from(""),
-            // // },
+            callbacks: CustomNetworkCallbacks.into(),
             max_connections: 1024,
             max_players: 1024,
             address: SocketAddr::from(([0, 0, 0, 0], 25565)),
-            connection_mode: ConnectionMode::Online {
-                prevent_proxy_connections: false,
+            connection_mode: match proxy_secret {
+                Ok(secret) => ConnectionMode::Velocity {
+                    secret: Arc::from(secret),
+                },
+                Err(_) => ConnectionMode::Online {
+                    prevent_proxy_connections: false,
+                },
             },
             ..Default::default()
         })
@@ -52,6 +60,30 @@ pub fn main() {
             ),
         )
         .run();
+}
+
+struct CustomNetworkCallbacks;
+
+#[async_trait]
+impl NetworkCallbacks for CustomNetworkCallbacks {
+    async fn server_list_ping(
+        &self,
+        _shared: &SharedNetworkState,
+        _remote_addr: SocketAddr,
+        _handshake_data: &HandshakeData,
+    ) -> ServerListPing {
+        let max_players = 0;
+
+        ServerListPing::Respond {
+            online_players: 0,
+            max_players,
+            player_sample: vec![],
+            description: "Limbo".into_text(),
+            favicon_png: &[],
+            version_name: MINECRAFT_VERSION.to_owned(),
+            protocol: PROTOCOL_VERSION,
+        }
+    }
 }
 
 #[derive(Component)]
