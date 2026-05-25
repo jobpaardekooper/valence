@@ -1,6 +1,7 @@
 #![allow(clippy::type_complexity)]
 
 use std::collections::VecDeque;
+use std::net::SocketAddr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rand::seq::SliceRandom;
@@ -9,6 +10,7 @@ use valence::prelude::*;
 use valence::protocol::sound::{Sound, SoundCategory};
 use valence::spawn::IsFlat;
 use valence_scoreboard::{Objective, ObjectiveBundle, ObjectiveDisplay, ObjectiveScores};
+use valence_text::color::NamedColor::{Red, Yellow};
 
 const START_POS: BlockPos = BlockPos::new(0, 100, 0);
 const VIEW_DIST: u8 = 10;
@@ -25,6 +27,18 @@ const BLOCK_TYPES: [BlockState; 7] = [
 
 pub fn main() {
     App::new()
+        .insert_resource(NetworkSettings {
+            // // connection_mode: ConnectionMode::Velocity {
+            // //     secret: Arc::from(""),
+            // // },
+            max_connections: 1024,
+            max_players: 1024,
+            address: SocketAddr::from(([0, 0, 0, 0], 25565)),
+            connection_mode: ConnectionMode::Online {
+                prevent_proxy_connections: false,
+            },
+            ..Default::default()
+        })
         .add_plugins(DefaultPlugins)
         .add_systems(
             Update,
@@ -90,7 +104,8 @@ fn init_clients(
         is_flat.0 = true;
         *game_mode = GameMode::Adventure;
 
-        client.send_chat_message("Welcome to epic infinite parkour game!".italic());
+        client.send_chat_message("Welcome to the libmo!".color(Yellow));
+        client.send_chat_message("You will be automatically reconnected to the server you tried to join once it becomes available.".color(Red).bold());
 
         let scoreboard_layer = commands
             .spawn((EntityLayer::new(&server), ScoreboardOwner(entity)))
