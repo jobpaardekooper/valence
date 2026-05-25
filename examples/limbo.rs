@@ -8,6 +8,7 @@ use rand::Rng;
 use valence::prelude::*;
 use valence::protocol::sound::{Sound, SoundCategory};
 use valence::spawn::IsFlat;
+use valence_scoreboard::{Objective, ObjectiveBundle, ObjectiveDisplay, ObjectiveScores};
 
 const START_POS: BlockPos = BlockPos::new(0, 100, 0);
 const VIEW_DIST: u8 = 10;
@@ -33,6 +34,7 @@ pub fn main() {
                 manage_chunks.after(reset_clients).before(manage_blocks),
                 manage_blocks,
                 despawn_disconnected_clients,
+                cleanup_disconnected_scoreboards.after(despawn_disconnected_clients),
             ),
         )
         .run();
@@ -42,9 +44,20 @@ pub fn main() {
 struct GameState {
     blocks: VecDeque<BlockPos>,
     score: u32,
+    high_score: u32,
     combo: u32,
     target_y: i32,
     last_block_timestamp: u128,
+    scoreboard_objective: Entity,
+}
+
+#[derive(Component)]
+struct ScoreboardOwner(Entity);
+
+const HIGH_SCORE_LABEL: &str = "";
+
+fn high_score_scores(high_score: u32) -> ObjectiveScores {
+    ObjectiveScores::with_map([(HIGH_SCORE_LABEL.to_owned(), high_score as i32)])
 }
 
 fn init_clients(
@@ -53,6 +66,7 @@ fn init_clients(
             Entity,
             &mut Client,
             &mut VisibleChunkLayer,
+            &mut VisibleEntityLayers,
             &mut IsFlat,
             &mut GameMode,
         ),
@@ -63,19 +77,47 @@ fn init_clients(
     biomes: Res<BiomeRegistry>,
     mut commands: Commands,
 ) {
-    for (entity, mut client, mut visible_chunk_layer, mut is_flat, mut game_mode) in &mut clients {
+    for (
+        entity,
+        mut client,
+        mut visible_chunk_layer,
+        mut visible_entity_layers,
+        mut is_flat,
+        mut game_mode,
+    ) in &mut clients
+    {
         visible_chunk_layer.0 = entity;
         is_flat.0 = true;
         *game_mode = GameMode::Adventure;
 
         client.send_chat_message("Welcome to epic infinite parkour game!".italic());
 
+        let scoreboard_layer = commands
+            .spawn((EntityLayer::new(&server), ScoreboardOwner(entity)))
+            .id();
+        visible_entity_layers.0.insert(scoreboard_layer);
+
+        let scoreboard_objective = commands
+            .spawn((
+                ScoreboardOwner(entity),
+                ObjectiveBundle {
+                    name: Objective::new("limbo-high"),
+                    display: ObjectiveDisplay("High Score".into_text()),
+                    scores: high_score_scores(0),
+                    layer: EntityLayerId(scoreboard_layer),
+                    ..Default::default()
+                },
+            ))
+            .id();
+
         let state = GameState {
             blocks: VecDeque::new(),
             score: 0,
+            high_score: 0,
             combo: 0,
             target_y: 0,
             last_block_timestamp: 0,
+            scoreboard_objective,
         };
 
         let layer = ChunkLayer::new(ident!("overworld"), &dimensions, &biomes, &server);
@@ -92,6 +134,7 @@ fn reset_clients(
         &mut GameState,
         &mut ChunkLayer,
     )>,
+    mut objective_scores: Query<&mut ObjectiveScores>,
 ) {
     for (mut client, mut pos, mut look, mut state, mut layer) in &mut clients {
         let out_of_bounds = (pos.0.y as i32) < START_POS.y - 32;
@@ -108,6 +151,9 @@ fn reset_clients(
                             .not_italic(),
                 );
             }
+
+            state.high_score = state.high_score.max(state.score);
+            update_high_score_objective(&state, &mut objective_scores);
 
             // Init chunks.
             for pos in ChunkView::new(START_POS.into(), VIEW_DIST).iter() {
@@ -139,7 +185,10 @@ fn reset_clients(
     }
 }
 
-fn manage_blocks(mut clients: Query<(&mut Client, &Position, &mut GameState, &mut ChunkLayer)>) {
+fn manage_blocks(
+    mut clients: Query<(&mut Client, &Position, &mut GameState, &mut ChunkLayer)>,
+    mut objective_scores: Query<&mut ObjectiveScores>,
+) {
     for (mut client, pos, mut state, mut layer) in &mut clients {
         let pos_under_player = BlockPos::new(
             (pos.0.x - 0.5).round() as i32,
@@ -171,6 +220,11 @@ fn manage_blocks(mut clients: Query<(&mut Client, &Position, &mut GameState, &mu
                     generate_next_block(&mut state, &mut layer, true)
                 }
 
+                if state.score > state.high_score {
+                    state.high_score = state.score;
+                    update_high_score_objective(&state, &mut objective_scores);
+                }
+
                 let pitch = 0.9 + ((state.combo as f32) - 1.0) * 0.05;
                 client.play_sound(
                     Sound::BlockNoteBlockBass,
@@ -183,6 +237,27 @@ fn manage_blocks(mut clients: Query<(&mut Client, &Position, &mut GameState, &mu
                 client.set_title("");
                 client.set_subtitle(state.score.to_string().color(Color::LIGHT_PURPLE).bold());
             }
+        }
+    }
+}
+
+fn update_high_score_objective(
+    state: &GameState,
+    objective_scores: &mut Query<&mut ObjectiveScores>,
+) {
+    if let Ok(mut scores) = objective_scores.get_mut(state.scoreboard_objective) {
+        scores.insert(HIGH_SCORE_LABEL, state.high_score as i32);
+    }
+}
+
+fn cleanup_disconnected_scoreboards(
+    mut commands: Commands,
+    scoreboards: Query<(Entity, &ScoreboardOwner)>,
+    clients: Query<(), With<Client>>,
+) {
+    for (entity, owner) in &scoreboards {
+        if clients.get(owner.0).is_err() {
+            commands.entity(entity).despawn();
         }
     }
 }
